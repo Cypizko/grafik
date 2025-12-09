@@ -1,7 +1,10 @@
 import asyncio
 import logging
 import time
+import os
 from datetime import datetime
+from aiohttp import web
+
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import FSInputFile, ReplyKeyboardMarkup, KeyboardButton
@@ -40,28 +43,27 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
+# --- ФУНКЦИЯ ПАРСИНГА ---
 async def get_schedule_final(addr):
-    print(f"📸 FINAL-MODE (Server): {addr['street']}...")
+    print(f"📸 SERVER-MODE: {addr['street']}...")
     
     chrome_options = Options()
     
-    # 🔥 НАСТРОЙКИ ДЛЯ СЕРВЕРА (Обязательные!)
-    chrome_options.add_argument("--headless=new") # Запуск без окна
-    chrome_options.add_argument("--no-sandbox")   # Нужно для Linux/Docker
-    chrome_options.add_argument("--disable-dev-shm-usage") # Чтобы не падало от нехватки памяти
+    # 🔥 НАСТРОЙКИ ДЛЯ RENDER (ОБЯЗАТЕЛЬНО!)
+    chrome_options.add_argument("--headless=new") # Работа без графического интерфейса
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--disable-gpu")
     chrome_options.add_argument("--window-size=1920,1080")
-    
     chrome_options.add_argument("--disable-blink-features=AutomationControlled")
     
-    # Мобильный режим
+    # Эмуляция iPhone (для красивой вертикальной таблицы)
     mobile_emulation = { "deviceName": "iPhone XR" }
     chrome_options.add_experimental_option("mobileEmulation", mobile_emulation)
     
-    # На сервере Linux путь к хрому может отличаться, но webdriver_manager обычно справляется
     service = Service(ChromeDriverManager().install())
     driver = webdriver.Chrome(service=service, options=chrome_options)
-    wait = WebDriverWait(driver, 15)
+    wait = WebDriverWait(driver, 20)
     
     results = [] 
     error_screenshot = "error_debug.png"
@@ -70,19 +72,23 @@ async def get_schedule_final(addr):
         driver.get(DTEK_URL)
         time.sleep(2) 
 
-        # 🔥 ФУНКЦИЯ "ЯДЕРНЫЙ ВЗРЫВ"
+        # --- ФУНКЦИЯ: УДАЛЕНИЕ МУСОРА ---
         def nuke_everything():
             try:
                 driver.execute_script("""
                     document.body.style.overflow = 'visible';
                     document.documentElement.style.overflow = 'visible';
+                    
+                    // Удаляем всё, что имеет fixed позицию (баннеры, шапки)
                     var all = document.querySelectorAll('*');
                     for (var i = 0; i < all.length; i++) {
                         var style = window.getComputedStyle(all[i]);
-                        if (style.position === 'fixed' || style.position === 'sticky') { all[i].remove(); }
-                        if (style.zIndex > 50 && (style.position === 'absolute' || style.position === 'fixed')) { all[i].remove(); }
+                        if (style.position === 'fixed' || style.position === 'sticky') {
+                            all[i].remove();
+                        }
                     }
-                    var bad = document.querySelectorAll('.modal, .modal-backdrop, .popup, .cookie, .cookies, .banner, .overlay, iframe');
+                    // Удаляем стандартные классы рекламы
+                    var bad = document.querySelectorAll('.modal, .modal-backdrop, .popup, .cookie, .cookies, .banner, .overlay, iframe, .feed-back-btn');
                     bad.forEach(el => el.remove());
                 """)
             except: pass
@@ -90,19 +96,17 @@ async def get_schedule_final(addr):
         nuke_everything()
         time.sleep(0.5)
 
-        # --- ФУНКЦИЯ ЗАПОЛНЕНИЯ ---
+        # --- ФУНКЦИЯ: ЗАПОЛНЕНИЕ ПОЛЕЙ ---
         def safe_fill(field_name, text_value):
             nuke_everything() 
             try:
                 inp = wait.until(EC.presence_of_element_located((By.NAME, field_name)))
-            except:
-                print(f"❌ Не нашел поле {field_name}")
-                return False
+            except: return False
 
             driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", inp)
             time.sleep(0.2)
             
-            # JS INJECTION
+            # JS Ввод (обходит блокировки)
             driver.execute_script(f"arguments[0].value = '{text_value}';", inp)
             driver.execute_script("arguments[0].dispatchEvent(new Event('input', { bubbles: true }));", inp)
             driver.execute_script("arguments[0].dispatchEvent(new Event('change', { bubbles: true }));", inp)
@@ -111,31 +115,27 @@ async def get_schedule_final(addr):
             time.sleep(0.8)
             
             try:
-                # JS Click
+                # JS Клик по первому элементу списка
                 script = f"""
                 var list = document.getElementById('{list_id}');
                 if (list) {{
                     var items = list.getElementsByTagName('div');
-                    if (items.length > 0) {{
-                        items[0].click(); 
-                        return true;
-                    }}
+                    if (items.length > 0) {{ items[0].click(); return true; }}
                 }}
                 return false;
                 """
-                clicked = driver.execute_script(script)
-                if not clicked: inp.send_keys(Keys.ENTER)
-            except:
+                if not driver.execute_script(script): 
+                    inp.send_keys(Keys.ENTER)
+            except: 
                 inp.send_keys(Keys.ENTER)
             
             time.sleep(0.5)
             return True
 
-        # Заполняем
+        # 1. Заполняем адрес
         if not safe_fill("city", addr['city']): raise Exception("Не ввел город")
         if not safe_fill("street", addr['street']): raise Exception("Не ввел улицу")
         
-        # Дом
         try:
             nuke_everything()
             inp_house = wait.until(EC.presence_of_element_located((By.NAME, "house_num")))
@@ -145,56 +145,50 @@ async def get_schedule_final(addr):
             inp_house.send_keys(Keys.ENTER)
         except: pass
 
-        # --- СКРИНШОТЫ ---
+        # --- АНАЛИЗ ГРУППЫ И СТАТУСА ---
         print("📸 Жду таблицу...")
         time.sleep(2)
         nuke_everything() 
 
-        # АНАЛИЗ
-        current_status_text = "Невідомо"
-        current_status_emoji = "❓"
+        # Поиск группы
         group_text = "Не знайдено"
-        
         try:
-            now = datetime.now()
-            hour = now.hour
-            time_str = f"{hour:02d}-{hour+1:02d}" 
-            
-            script_status = f"""
-            var cells = document.querySelectorAll('td');
-            for (var i = 0; i < cells.length; i++) {{
-                if (cells[i].innerText.includes('{time_str}')) {{
-                    var statusCell = cells[i].nextElementSibling;
-                    if (statusCell) {{ return statusCell.className; }}
-                }}
-            }}
-            return 'unknown';
-            """
-            status_class = driver.execute_script(script_status)
-            
-            if "cell-scheduled" in status_class: 
-                current_status_emoji = "🔴"
-                current_status_text = "СВІТЛА НЕМАЄ"
-            elif "cell-non-scheduled" in status_class:
-                current_status_emoji = "🟢"
-                current_status_text = "СВІТЛО Є"
-            elif "maybe" in status_class or "half" in status_class:
-                current_status_emoji = "🟡"
-                current_status_text = "МОЖЛИВЕ ВІДКЛЮЧЕННЯ"
-        except: pass
-
-        try:
-            body_text = driver.find_element(By.TAG_NAME, "body").text
+            page_text = driver.find_element(By.TAG_NAME, "body").text
             import re
-            match = re.search(r"Група\s*([\d\.]+)", body_text)
+            match = re.search(r"Група\s*([\d\.]+)", page_text)
             if match: group_text = match.group(1)
-            elif addr['house'] == "104": group_text = "5.1"
+            elif addr['house'] == "16": group_text = "Unknown"
             elif addr['house'] == "77": group_text = "1.1"
+            elif addr['house'] == "104": group_text = "5.1"
         except: pass
 
-        caption_base = f"{current_status_emoji} {current_status_text}\n🏠 {addr['header']}\n⚡️ Група: {group_text}"
+        # Определение статуса по цвету ячейки
+        def get_status_text():
+            try:
+                now = datetime.now()
+                hour = now.hour
+                time_str = f"{hour:02d}-{hour+1:02d}"
+                
+                script = f"""
+                var tds = document.querySelectorAll('td');
+                for (var i = 0; i < tds.length; i++) {{
+                    if (tds[i].innerText.includes('{time_str}')) {{
+                        var next = tds[i].nextElementSibling;
+                        if (next) return next.className;
+                    }}
+                }}
+                return '';
+                """
+                cls = driver.execute_script(script)
+                if "cell-scheduled" in cls: return "🔴 СВІТЛА НЕМАЄ"
+                if "cell-non-scheduled" in cls: return "🟢 СВІТЛО Є"
+                if "maybe" in cls or "half" in cls: return "🟡 МОЖЛИВЕ ВІДКЛЮЧЕННЯ"
+                return "❓ Статус невідомий"
+            except: return "❓ Статус невідомий"
 
-        # ФОТО 1
+        base_caption = f"🏠 {addr['header']}\n⚡️ Група: {group_text}"
+
+        # --- ФОТО 1: СЕГОДНЯ ---
         try:
             target = driver.find_element(By.CLASS_NAME, "table2col")
             driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", target)
@@ -204,31 +198,53 @@ async def get_schedule_final(addr):
             target.screenshot(path_today)
             
             try: date_txt = driver.find_element(By.CSS_SELECTOR, ".date.active span[rel='date']").text
-            except: date_txt = "Сьогодні"
+            except: date_txt = datetime.now().strftime("%d.%m.%y")
             
-            results.append((path_today, f"{caption_base}\n📅 {date_txt}"))
+            status_now = get_status_text()
+            results.append((path_today, f"{status_now}\n{base_caption}\n📅 {date_txt}"))
         except: pass
 
-        # ФОТО 2
+        # --- ФОТО 2: ЗАВТРА ---
         has_tomorrow = False
+        print("👉 Ищу кнопку 'На завтра'...")
+        
         try:
-            tomorrow_btn = driver.find_element(By.XPATH, "//div[contains(text(), 'на завтра')]")
-            driver.execute_script("arguments[0].click();", tomorrow_btn)
-            time.sleep(1.5)
-            nuke_everything()
+            # ЛОГИКА: Находим все даты и кликаем ту, у которой НЕТ класса active
+            script_click_tomorrow = """
+            var dates = document.querySelectorAll('.date');
+            for (var i = 0; i < dates.length; i++) {
+                if (!dates[i].classList.contains('active')) {
+                    dates[i].click();
+                    return true;
+                }
+            }
+            return false;
+            """
+            clicked = driver.execute_script(script_click_tomorrow)
+            
+            if clicked:
+                time.sleep(2)
+                nuke_everything() # Чистим мусор снова
 
-            target_tmr = driver.find_element(By.CLASS_NAME, "table2col")
-            if target_tmr.is_displayed():
-                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", target_tmr)
-                path_tmr = "status_tomorrow.png"
-                target_tmr.screenshot(path_tmr)
-                
-                try: date_tmr = tomorrow_btn.find_element(By.CSS_SELECTOR, "span[rel='date']").text
-                except: date_tmr = "Завтра"
-                
-                results.append((path_tmr, f"{caption_base}\n📅 {date_tmr}"))
-                has_tomorrow = True
-        except: pass
+                target_tmr = driver.find_element(By.CLASS_NAME, "table2col")
+                if target_tmr.is_displayed():
+                    driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", target_tmr)
+                    path_tmr = "status_tomorrow.png"
+                    target_tmr.screenshot(path_tmr)
+                    
+                    # Пытаемся достать дату из активной вкладки
+                    try: 
+                        date_tmr = driver.find_element(By.CSS_SELECTOR, ".date.active span[rel='date']").text
+                    except: 
+                        date_tmr = "Завтра"
+                    
+                    results.append((path_tmr, f"ℹ️ Графік на завтра\n{base_caption}\n📅 {date_tmr}"))
+                    has_tomorrow = True
+            else:
+                print("⚠️ Вторая вкладка с датой не найдена.")
+
+        except Exception as e:
+            print(f"Ошибка получения завтра: {e}")
 
         return results, has_tomorrow, None
 
@@ -239,7 +255,7 @@ async def get_schedule_final(addr):
     finally:
         driver.quit()
 
-# --- КЛАВИАТУРА И БОТ ---
+# --- КЛАВИАТУРА ---
 def get_main_kb():
     builder = ReplyKeyboardBuilder()
     builder.add(KeyboardButton(text=ADDR_1['btn']))
@@ -247,9 +263,10 @@ def get_main_kb():
     builder.adjust(2) 
     return builder.as_markup(resize_keyboard=True)
 
+# --- БОТ ХЕНДЛЕРЫ ---
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    await message.answer("⚡ Бот готовий! (Server Mode)", reply_markup=get_main_kb())
+    await message.answer("⚡ Бот готовий! Оберіть адресу:", reply_markup=get_main_kb())
 
 @dp.message(F.text == ADDR_1['btn'])
 async def process_addr1(message: types.Message):
@@ -276,10 +293,29 @@ async def process_request(message, addr):
     else:
         await message.answer("🤷‍♂️ Графік не знайдено.")
 
+# --- ВЕБ-СЕРВЕР (Для Render & UptimeRobot) ---
+async def health_check(request):
+    return web.Response(text="Bot is alive!", status=200)
+
+async def start_dummy_server():
+    app = web.Application()
+    app.router.add_get('/', health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 8080)) # Render передаст порт сюда
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    print(f"🌍 Web server started on port {port}")
+
 async def main():
-    print("Бот запущен...")
+    print("🚀 Бот запускается...")
     await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
+    
+    # Запускаем параллельно: Бот + Веб-сервер
+    await asyncio.gather(
+        dp.start_polling(bot),
+        start_dummy_server()
+    )
 
 if __name__ == '__main__':
     asyncio.run(main())
